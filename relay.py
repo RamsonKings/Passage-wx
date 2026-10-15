@@ -155,6 +155,9 @@ def series_from_grids(grids, pts, scale):
 
 
 # ---------------------------------------------------------------- ECMWF open data
+ECMWF_SOURCES = ["ecmwf", "google", "azure", "aws"]   # data.ecmwf.int first; cloud mirrors as backup
+
+
 def ecmwf_block(model, stream, params, steps, tag, pts, scales, rename):
     """latest 00z / 12z run (those go to 360 h; 06z / 18z stop at 144 h)"""
     from ecmwf.opendata import Client
@@ -162,16 +165,31 @@ def ecmwf_block(model, stream, params, steps, tag, pts, scales, rename):
     base, last = None, None
     cand = NOW.replace(hour=12 if NOW.hour >= 12 else 0)
     for _ in range(4):
-        kw = dict(type="fc", step=steps, param=params, target=target, date=cand.strftime("%Y%m%d"), time=cand.hour)
-        if stream:
-            kw["stream"] = stream
-        try:
-            Client(source="aws", model=model).retrieve(**kw)
+        # several mirrors: AWS S3 throttles ("503 Slow Down"); small chunks of steps, few retries, then the next mirror
+        ok = False
+        for source in ECMWF_SOURCES:
+            try:
+                if os.path.exists(target):
+                    os.remove(target)
+                for k in range(0, len(steps), 12):
+                    part = target + ".part"
+                    kw = dict(type="fc", step=steps[k:k + 12], param=params, target=part, date=cand.strftime("%Y%m%d"), time=cand.hour)
+                    if stream:
+                        kw["stream"] = stream
+                    Client(source=source, model=model, maximum_retries=3, retry_after=15).retrieve(**kw)
+                    with open(target, "ab") as out_f, open(part, "rb") as in_f:
+                        out_f.write(in_f.read())
+                    os.remove(part)
+                ok = True
+                log(f"{tag}: downloaded run {cand:%Y-%m-%d %HZ} from {source}")
+                break
+            except Exception as e:
+                last = f"{source}: {e}"
+                log(f"{tag}: {source} failed for run {cand:%Y-%m-%d %HZ} ({str(e)[:120]})")
+        if ok:
             base = cand
             break
-        except Exception as e:
-            last = e
-            cand -= dt.timedelta(hours=12)
+        cand -= dt.timedelta(hours=12)
     if base is None:
         raise RuntimeError(f"no {tag} run found ({last})")
     grids = {}
