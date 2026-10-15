@@ -1,0 +1,19 @@
+# Route for the weather relay: one waypoint per line  -  name; latitude; longitude
+# Latitude S and longitude W are negative. Edit this file on GitHub for each voyage and press "Commit changes":
+# the relay rebuilds automatically in about 15-30 minutes.
+COSP Port Hedland; -20.000; 118.500
+Lombok Str S; -8.917; 115.833
+Lombok Str N; -8.083; 115.800
+Makassar Str S; -3.500; 117.750
+Makassar Str N; 1.000; 119.000
+Sibutu Passage; 4.833; 119.500
+Sulu Sea W of Cuyo; 10.500; 120.333
+Mindoro Str N (Apo); 12.750; 120.250
+Off C. Calavite; 13.667; 120.083
+Off C. Bojeador; 18.667; 120.333
+Luzon Str E of Lanyu; 21.500; 121.750
+E of Taiwan; 24.500; 122.667
+NE of Taiwan / ECS; 26.500; 123.500
+East China Sea; 31.000; 124.000
+Yellow Sea approach; 34.500; 121.000
+Rizhao arr; 35.333; 119.667
