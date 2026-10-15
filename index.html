@@ -35,7 +35,7 @@ h1{font:700 30px/1.05 var(--f-display);letter-spacing:.02em;margin:0;text-transf
 h1 span{color:var(--accent)}
 .sub{color:var(--muted);font-size:13px}
 .panel{background:var(--panel);border:1px solid var(--line);border-radius:6px;padding:16px}
-.form{display:grid;grid-template-columns:1.1fr .45fr .7fr .7fr 1fr 1.1fr .9fr auto;gap:12px;align-items:end}
+.form{display:grid;grid-template-columns:1.05fr .45fr .65fr .65fr .95fr .95fr .9fr .95fr auto;gap:12px;align-items:end}
 .spdinfo{grid-column:1/-1;font:12.5px/1.4 var(--f-body);color:var(--muted)}
 .spdinfo b{color:var(--ink)}
 .spdinfo a{color:var(--accent)}
@@ -262,11 +262,23 @@ label.inline select{width:auto;padding:6px 8px}
       </label>
       <label for="model">Wind model
         <select id="model">
-          <option value="ensemble">Ensemble: ECMWF + GFS + ICON (waves 3 models)</option>
-          <option value="best_match">Best match</option>
-          <option value="ecmwf_ifs025">ECMWF IFS</option>
-          <option value="gfs_seamless">GFS</option>
+          <option value="ensemble">All models · median + range (recommended)</option>
+          <option value="ecmwf_hres">ECMWF IFS only</option>
+          <option value="ecmwf_aifs025_single">ECMWF AIFS (AI) only</option>
+          <option value="gfs_seamless">NOAA GFS only</option>
+          <option value="best_match">Open-Meteo best match (direct only)</option>
         </select>
+        <span class="hint">"Only" = wind/Beaufort column shows that one model; the Models range column still shows all.</span>
+      </label>
+      <label for="waveModel">Wave / swell model
+        <select id="waveModel" title="Source for total waves, wind sea and swell">
+          <option value="ensemble">All models · median + range (recommended)</option>
+          <option value="ecmwf_wam">ECMWF WAM only</option>
+          <option value="meteofrance_wave">Copernicus MFWAM only</option>
+          <option value="ncep_gfswave025">NOAA GFS-Wave only</option>
+          <option value="best_match">Open-Meteo best match (direct only)</option>
+        </select>
+        <span class="hint">ECMWF WAM gives total sea only; wind sea / swell split then comes from MFWAM + GFS-Wave.</span>
       </label>
       <button type="submit" class="run" id="runBtn">Run forecast</button>
       <div class="spdinfo" id="spdInfo"></div>
@@ -308,7 +320,7 @@ label.inline select{width:auto;padding:6px 8px}
   <div class="legend" id="legend" hidden>
     <span>Times are ship LT. Leg STW = ordered speed less weather loss; Leg SOG = Leg STW + current, mean on the leg ending at that waypoint; <span class="clim">violet ✱</span> = no forecast current for most of that leg, so the route's climatological current is used.</span>
     <span>Rel = where wind / swell comes FROM relative to ship's head. Current set = direction TOWARDS. Along = current component on the course (+ fair, − foul).</span>
-    <span>Marine model range ≈ 9–10 days, wind ≈ 15 days. “–” = beyond range or too near land. Not a substitute for official warnings (NAVTEX / SafetyNET, JTWC / JMA).</span>
+    <span>ECMWF IFS wind and ECMWF WAM waves are selected separately. ECMWF WAM 9 km is the default; missing wave partitions are supplemented from GFS-Wave when available and labelled in the report. Marine/current range varies by model and location. “–” = missing/out of range or too near land. Not a substitute for official warnings (NAVTEX / SafetyNET, JTWC / JMA).</span>
   </div>
   </div>
 
@@ -440,6 +452,7 @@ Rizhao arr; 35.333; 119.667; -0.2`;
 
 const MARINE_URL = "https://marine-api.open-meteo.com/v1/marine";
 const WX_URL = "https://api.open-meteo.com/v1/forecast";
+const ECMWF_WX_URL = "https://api.open-meteo.com/v1/ecmwf";
 const R_NM = 3440.065, STEP_HRS = 1.5, MAX_FCST_DAYS = 15, H = 3600e3;
 /* step length for current sampling: about 1.5 h of steaming in open water, 0.5 h on short legs (straits, approaches) */
 const stepsFor = (d, stw) => Math.max(1, Math.ceil(d / (d < 150 ? 8 : 25)));   // nm per step: 8 in straits / short legs, 25 in open sea (model grid 1/12°)
@@ -641,10 +654,31 @@ async function getJSON(url, params) {
   throw last;
 }
 const isoDate = t => new Date(t).toISOString().slice(0, 10);
+function marineTimeMs(x) {
+  if (typeof x === "number" && isFinite(x)) return x < 1e12 ? x * 1000 : x;
+  let s = String(x ?? "").trim(); if (!s) return NaN;
+  if (/^\d{4}-\d\d-\d\d \d\d:\d\d/.test(s)) s = s.replace(" ", "T");
+  if (/^\d{4}-\d\d-\d\dT\d\d:\d\d$/.test(s)) s += ":00Z";
+  else if (/^\d{4}-\d\d-\d\dT\d\d:\d\d:\d\d(?:\.\d+)?$/.test(s)) s += "Z";
+  return Date.parse(s);
+}
 function idxAt(block, t) {
-  const h = block && block.hourly; if (!h || !h.time || !h.time.length) return null;
-  const t0 = Date.parse(h.time[0] + ":00Z"), i = Math.round((t - t0) / H);
-  return i >= 0 && i < h.time.length ? i : null;
+  const h = block && block.hourly, times = h && h.time;
+  if (!times || !times.length || !isFinite(t)) return null;
+  const first = marineTimeMs(times[0]), last = marineTimeMs(times[times.length - 1]);
+  if (!isFinite(first) || !isFinite(last) || t < first || t > last) return null;
+  // Binary-search neighbouring timestamps; marine models do not all have hourly output.
+  let lo = 0, hi = times.length - 1;
+  while (lo <= hi) {
+    const mid = (lo + hi) >> 1, mt = marineTimeMs(times[mid]);
+    if (!isFinite(mt)) return null;
+    if (mt === t) return mid;
+    if (mt < t) lo = mid + 1; else hi = mid - 1;
+  }
+  const candidates = [hi, lo].filter(i => i >= 0 && i < times.length);
+  if (!candidates.length) return null;
+  candidates.sort((a, b) => Math.abs(marineTimeMs(times[a]) - t) - Math.abs(marineTimeMs(times[b]) - t));
+  return candidates[0];
 }
 const val = (block, v, i) => (i == null || !block || !block.hourly || !block.hourly[v]) ? null : block.hourly[v][i];
 function currentAt(block, t) {
@@ -656,9 +690,42 @@ function currentAt(block, t) {
 
 /* ---------- multi-model ensemble (triangulation): independent centres, median value + min/max spread ---------- */
 const ENS_WX = ["ecmwf_ifs025", "gfs_seamless", "icon_seamless"];                 // ECMWF · NOAA · DWD
-const ENS_WAVE = ["meteofrance_wave", "ecmwf_wam025", "ncep_gfswave025"];          // MFWAM (= Copernicus) · ECMWF WAM · NOAA GFS-Wave
-const WAVE_VARS = "wave_height,wave_direction,wind_wave_height,wind_wave_direction,wind_wave_period,swell_wave_height,swell_wave_direction,swell_wave_period";
-const MODEL_NAME = { aifs: "ECMWF AIFS (AI)", ecmwf_ifs025: "ECMWF", gfs_seamless: "GFS", icon_seamless: "ICON", meteofrance_wave: "MFWAM", ecmwf_wam025: "ECMWF WAM", ncep_gfswave025: "GFS-Wave" };
+const ENS_WAVE = ["meteofrance_wave", "ecmwf_wam025", "ncep_gfswave025"];          // MFWAM · ECMWF WAM · GFS-Wave
+const WAVE_VARS = "wave_height,wave_direction,wave_period,wave_peak_period,wind_wave_height,wind_wave_direction,wind_wave_period,wind_wave_peak_period,swell_wave_height,swell_wave_direction,swell_wave_period,swell_wave_peak_period";
+const MODEL_NAME = { aifs: "ECMWF AIFS (AI)", ecmwf_aifs025_single: "ECMWF AIFS (AI)", ecmwf_hres: "ECMWF IFS HRES 9 km", ecmwf_ifs025: "ECMWF IFS 0.25°", gfs_seamless: "GFS", icon_seamless: "ICON", meteofrance_wave: "MFWAM", ecmwf_wam: "ECMWF WAM 9 km", ecmwf_wam025: "ECMWF WAM 0.25°", ncep_gfswave025: "GFS-Wave", best_match: "Best match" };
+const RELAY_WX_NAME = { ecmwf_ifs025: "ECMWF IFS", aifs: "ECMWF AIFS (AI)", gfs_seamless: "NOAA GFS" };
+const RELAY_WAVE_NAME = { ecmwf_wam025: "ECMWF WAM", meteofrance_wave: "Copernicus MFWAM", ncep_gfswave025: "NOAA GFS-Wave" };
+const relayWxLabel = () => MODEL_PICK.wx ? RELAY_WX_NAME[MODEL_PICK.wx] + " only (relay) · range = all models" : "ECMWF IFS + AIFS + GFS median (relay)";
+const relayWaveLabel = () => MODEL_PICK.wave ? RELAY_WAVE_NAME[MODEL_PICK.wave] + " only (relay)" + (MODEL_PICK.wave === "ecmwf_wam025" ? ", sea/swell split from MFWAM + GFS-Wave" : "") + " · range = all models" : "relay median (MFWAM, ECMWF WAM, GFS-Wave)";
+function windModelLabel(model) {
+  if (model === "ensemble") return "ECMWF + GFS + ICON median (via Open-Meteo)";
+  if (model === "ecmwf_hres" || model === "ecmwf_ifs025") return "ECMWF IFS HRES 9 km via dedicated ECMWF API (Open-Meteo)";
+  if (model === "gfs_seamless") return "GFS (via Open-Meteo)";
+  return `${MODEL_NAME[model] || model} (via Open-Meteo)`;
+}
+function waveModelLabel(model) {
+  if (model === "ensemble") return "3-model median (MFWAM + ECMWF WAM + GFS-Wave) via Open-Meteo";
+  if (model === "ecmwf_wam") return "ECMWF WAM 9 km hourly via Open-Meteo";
+  if (model === "ecmwf_wam025") return "ECMWF WAM 0.25° (3-hourly) via Open-Meteo";
+  if (model === "best_match") return "Open-Meteo Marine best match";
+  return `${MODEL_NAME[model] || model} via Open-Meteo`;
+}
+function normalizeModelFields(b, models) {
+  if (!b || !b.hourly) return b;
+  const Hh = b.hourly;
+  // A multi-model API response may suffix variable names by model. Map the selected model's
+  // field to the ordinary variable name expected by the planner, without averaging it.
+  for (const model of models) {
+    const suffix = "_" + model;
+    for (const [key, value] of Object.entries(Hh)) {
+      if (!key.endsWith(suffix)) continue;
+      const base = key.slice(0, -suffix.length);
+      if (!Array.isArray(Hh[base]) || Hh[base].every(x => x == null)) Hh[base] = value;
+    }
+  }
+  b.modelSources = models.slice();
+  return b;
+}
 /* Open-Meteo returns <variable>_<model> per model; write the median into <variable> and keep _min / _max / _n / _by */
 function ensembleBlock(b, models) {
   if (!b || !b.hourly) return b;
@@ -683,17 +750,58 @@ function ensembleBlock(b, models) {
 }
 /* wind/pressure: one model, or the ensemble (falls back to best match if the ensemble request is refused) */
 async function getWx(params, model) {
-  if (model !== "ensemble") return getJSON(WX_URL, { ...params, models: model });
+  // Use Open-Meteo's dedicated ECMWF endpoint for IFS HRES 9 km. It returns canonical
+  // variable names (wind_speed_10m, etc.) rather than relying on model-suffixed fields.
+  // Keep the old setting key supported for any browser restoring a pre-v3 saved config.
+  if (model === "ecmwf_hres" || model === "ecmwf_ifs025") {
+    const { models, ...ecmwfParams } = params;
+    return getJSON(ECMWF_WX_URL, ecmwfParams);
+  }
+  if (model !== "ensemble") {
+    const res = await getJSON(WX_URL, { ...params, models: model });
+    // Open-Meteo may suffix fields for single-model selection (e.g. wind_speed_10m_gfs_seamless).
+    // Normalize them to the plain keys used by the route table and map layers.
+    return model && model !== "best_match" ? res.map(b => normalizeModelFields(b, [model])) : res;
+  }
   try { return (await getJSON(WX_URL, { ...params, models: ENS_WX.join(",") })).map(b => ensembleBlock(b, ENS_WX)); }
   catch (e) { if (/limit/i.test(e.message)) throw e; return getJSON(WX_URL, { ...params, models: "best_match" }); }
 }
-/* waves: ensemble of three wave models, or the default Open-Meteo marine set */
-async function getMarine(params, ens) {
-  if (!ens) return getJSON(MARINE_URL, { ...params, hourly: MAR_VARS });
-  try { return (await getJSON(MARINE_URL, { ...params, hourly: WAVE_VARS, models: ENS_WAVE.join(",") })).map(b => ensembleBlock(b, ENS_WAVE)); }
-  catch (e) { if (/limit/i.test(e.message)) throw e; return getJSON(MARINE_URL, { ...params, hourly: MAR_VARS }); }
+/* Marine source is independent of the wind source. In ECMWF mode request WAM explicitly;
+   do not silently substitute another wave model if this request fails. */
+async function getMarine(params, waveModel = "best_match") {
+  if (waveModel === "ensemble") {
+    try {
+      const r = await getJSON(MARINE_URL, { ...params, hourly: WAVE_VARS, models: ENS_WAVE.join(",") });
+      return r.map(b => ensembleBlock(b, ENS_WAVE));
+    } catch (e) {
+      if (/limit/i.test(e.message)) throw e;
+      throw new Error("wave-model ensemble unavailable: " + e.message);
+    }
+  }
+  if (waveModel && waveModel !== "best_match") {
+    const r = await getJSON(MARINE_URL, { ...params, hourly: WAVE_VARS, models: waveModel });
+    return r.map(b => normalizeModelFields(b, [waveModel]));
+  }
+  return getJSON(MARINE_URL, { ...params, hourly: MAR_VARS });
 }
 let RELAY_STATE = null;
+/* which single model the user picked (relay keys), or null = median of all */
+const PICK_WX = { ecmwf_hres: "ecmwf_ifs025", ecmwf_ifs025: "ecmwf_ifs025", ecmwf_aifs025_single: "aifs", aifs: "aifs", gfs_seamless: "gfs_seamless" };
+const PICK_WAVE = { ecmwf_wam: "ecmwf_wam025", ecmwf_wam025: "ecmwf_wam025", meteofrance_wave: "meteofrance_wave", ncep_gfswave025: "ncep_gfswave025" };
+let MODEL_PICK = { wx: null, wave: null };
+/* after the median: put the picked model's values in the plain keys; keep _min/_max/_n (all-model range) */
+function applyPick(b, name) {
+  if (!b || !name) return b;
+  const Hh = b.hourly, sfx = "_" + name; let hit = false;
+  for (const k of Object.keys(Hh)) if (k.endsWith(sfx)) {
+    const base = k.slice(0, -sfx.length), col = Hh[k];
+    if (!Array.isArray(Hh[base]) || !col.some(x => x != null)) continue;
+    Hh[base] = Hh[base].map((m, j) => col[j] != null ? col[j] : m);   // gaps (model beyond its range) keep the median
+    hit = true;
+  }
+  if (hit) b.picked = name;
+  return b;
+}
 const fmtAge = iso => { const h = (Date.now() - Date.parse(iso)) / H; return h < 1 ? `${Math.round(h * 60)} min old` : `${h.toFixed(1)} h old`; };
 /* ---------- weather relay (GitHub Actions → relay.json): one download instead of hundreds of API calls ---------- */
 async function loadRelay(url) {
@@ -756,7 +864,7 @@ function relayWx(R, lat, lon, t0, t1) {
     Object.assign(Hh, { ["wind_speed_10m_" + name]: ws, ["wind_direction_10m_" + name]: wd, ["wind_gusts_10m_" + name]: gu, ["pressure_msl_" + name]: ms }); models.push(name);
   }
   if (!models.length) return null;
-  return ensembleBlock({ hourly: Hh, src: "relay" }, models);
+  return applyPick(ensembleBlock({ hourly: Hh, src: "relay" }, models), MODEL_PICK.wx);
 }
 function relayMarine(R, lat, lon, t0, t1, cur) {
   const i = relayNear(R.coarse, lat, lon, 30); if (i < 0) return null;
@@ -776,11 +884,11 @@ function relayMarine(R, lat, lon, t0, t1, cur) {
   add("ncep_gfswave025", [["wave_height", "swh"], ["wave_direction", "mwd", 1], ["wind_wave_height", "shww"], ["wind_wave_direction", "mdww", 1], ["wind_wave_period", "mpww"],
                           ["swell_wave_height", "shts"], ["swell_wave_direction", "mdts", 1], ["swell_wave_period", "mpts"]], "gfs_wave");
   if (!models.length) return null;
-  const b = ensembleBlock({ hourly: Hh, hourly_units: { ocean_current_velocity: "kn" }, src: "relay" }, models);
+  const b = applyPick(ensembleBlock({ hourly: Hh, hourly_units: { ocean_current_velocity: "kn" }, src: "relay" }, models), MODEL_PICK.wave);
   if (cur) { const c = hrs.map(t => cur(t)); b.hourly.ocean_current_velocity = c.map(x => x ? x.kn : null); b.hourly.ocean_current_direction = c.map(x => x ? x.dir : null); }
   return b;
 }
-const MAR_VARS = "wave_height,wind_wave_height,wind_wave_direction,wind_wave_period,swell_wave_height,swell_wave_direction,swell_wave_period,ocean_current_velocity,ocean_current_direction";
+const MAR_VARS = WAVE_VARS + ",ocean_current_velocity,ocean_current_direction";
 
 /* ---------- ship profiles & limits ---------- */
 const DEF_LIM = { cpaAmber: 400, cpaRed: 300, bfAmber: 6, bfRed: 8, hsAmber: 4, hsRed: 6, rollHAmber: 2, rollHRed: 3, syncLo: 0.8, syncHi: 1.2, parLo: 0.4, parHi: 0.6, use123: true };
@@ -1146,6 +1254,7 @@ async function runForecast(opt, progress) {
   // wind along the track for the weather speed loss – fetched in parallel with the currents
   const useLoss = opt.ship && opt.ship.useLoss !== false && kwonLoss(5, 0, opt.stw, opt.ship) != null;
   const windFor = new Map();
+  MODEL_PICK = { wx: PICK_WX[opt.model] || null, wave: PICK_WAVE[opt.waveModel] || null };
   const RL = opt.relay || null, rT0 = startUTC - 6 * H, rT1 = maxEnd;
   const windJob = !useLoss ? Promise.resolve() : (async () => {
     const wpts = pts.filter((p, i) => i % 3 === 0);
@@ -1262,28 +1371,38 @@ async function runForecast(opt, progress) {
     nodes.push({ t, lat: L.lat, lon: L.lon, crs: pl.course, sog: pn ? pn.sog : opt.stw, leg: wps.length - 1, dist: cum, clim: pn ? pn.clim : false }); }
 
   // Stage 2 + 3: wind and marine (waves, sea, swell) from Open-Meteo first; Copernicus Marine fills whatever Open-Meteo could not give
-  const wantCmW = typeof DOMParser !== "undefined", ens = opt.model === "ensemble";
+  const wantCmW = typeof DOMParser !== "undefined", ens = opt.model === "ensemble", waveEns = opt.waveModel === "ensemble";
+  const waveMaxEnd = (["ecmwf_wam", "ecmwf_wam025", "ncep_gfswave025"].includes(opt.waveModel) || waveEns) ? maxEnd : endM;
   let tn = [];
   if (opt.trackWx !== false) { let lastKept = -Infinity;
     tn = nodes.filter((n, i) => { if (i === nodes.length - 1 || n.t - lastKept >= 6 * H) { lastKept = n.t; return true; } return false; }); }   // one point per ~6 h
   // relay first: blocks for every waypoint / track point that lies on the relay route; Open-Meteo only for the rest
   const rW = wps.map(w => RL ? relayWx(RL, w.lat, w.lon, rT0, rT1) : null), rM = wps.map(w => RL ? relayMarine(RL, w.lat, w.lon, rT0, rT1) : null);
   const needW = rW.some(x => !x), needM = rM.some(x => !x);
-  if (needW || needM) progress("Fetching wind, waves and swell at each waypoint ETA (Open-Meteo)…");
+  if (needW || needM) progress(`Fetching wind (${windModelLabel(opt.model)}) and waves/swell (${waveModelLabel(opt.waveModel)}) at waypoint ETAs…`);
   const s2 = isoDate(etas[0]), e2 = isoDate(Math.min(etas[etas.length - 1], maxEnd));
   const lats = wps.map(w => w.lat.toFixed(3)).join(","), lons = wps.map(w => w.lon.toFixed(3)).join(",");
   const [omMar, wxOm] = await Promise.all([
-    !needM ? Promise.resolve([]) : getMarine({ latitude: lats, longitude: lons, start_date: s2, end_date: isoDate(Math.max(Math.min(etas[etas.length - 1], ens ? maxEnd : endM), etas[0])), timezone: "GMT" }, ens).catch(e => { marineErr.push(e.message); return []; }),
+    !needM ? Promise.resolve([]) : getMarine({ latitude: lats, longitude: lons, start_date: s2, end_date: isoDate(Math.max(Math.min(etas[etas.length - 1], waveMaxEnd), etas[0])), timezone: "GMT" }, opt.waveModel).catch(e => { marineErr.push("waves: " + e.message); return []; }),
     !needW ? Promise.resolve([]) : getWx({ latitude: lats, longitude: lons, start_date: s2, end_date: e2, timezone: "GMT", wind_speed_unit: "kn",
       cell_selection: "sea", hourly: WX_VARS }, opt.model).catch(e => { marineErr.push("wind: " + e.message); return []; })
   ]);
   const wx = wps.map((w, i) => rW[i] || (wxOm.length === wps.length ? wxOm[i] : null));
   const mar = wps.map((w, i) => rM[i] || (omMar.length === wps.length ? omMar[i] : null));
   const usedRelay = rW.some(Boolean) || rM.some(Boolean);
+  if (needW) {   // never show every wind cell blank silently when the API shape or naming changes
+    const omIdx = wps.map((w, i) => i).filter(i => !rW[i]);
+    if (wxOm.length !== wps.length) marineErr.push(`wind: API returned ${wxOm.length} location record(s) for ${wps.length} waypoints; wind cannot be mapped reliably.`);
+    else {
+      const readable = omIdx.filter(i => { const ix = idxAt(wx[i], etas[i]); return val(wx[i], "wind_speed_10m", ix) != null && val(wx[i], "wind_direction_10m", ix) != null; }).length;
+      if (readable === 0) marineErr.push("wind: API responded but no wind_speed_10m / wind_direction_10m values matched the waypoint ETAs after model-field normalization.");
+      else if (readable < omIdx.length) marineErr.push(`wind: usable speed and direction available at ${readable} of ${omIdx.length} waypoint ETAs; remaining cells are outside data coverage or missing from the response.`);
+    }
+  }
   if (tn.length) {
     if (RL) tn.forEach(n => { n.W = relayWx(RL, n.lat, n.lon, rT0, rT1); n.M = relayMarine(RL, n.lat, n.lon, rT0, rT1); });
     const tnNeed = tn.filter(n => !n.W || !n.M);
-    if (tnNeed.length) progress("Fetching weather along the track for the map (Open-Meteo)…");
+    if (tnNeed.length) progress(`Fetching along-track weather (${windModelLabel(opt.model)}; ${waveModelLabel(opt.waveModel)})…`);
     let omDown = !omMar.length && marineErr.length > 0;
     for (let b = 0; b < tnNeed.length; b += 25) {
       const ch = tnNeed.slice(b, b + 25);
@@ -1291,7 +1410,7 @@ async function runForecast(opt, progress) {
       if (s3 > e3) break;
       const la = ch.map(n => n.lat.toFixed(3)).join(","), lo = ch.map(n => n.lon.toFixed(3)).join(",");
       const [tm, tw] = await Promise.all([
-        (!omDown && s3 <= (ens ? maxEnd : endM) ? getMarine({ latitude: la, longitude: lo, start_date: isoDate(s3), end_date: isoDate(Math.min(e3, ens ? maxEnd : endM)), timezone: "GMT" }, ens) : Promise.resolve([])).catch(e => { marineErr.push(e.message); omDown = true; return []; }),
+        (!omDown && s3 <= waveMaxEnd ? getMarine({ latitude: la, longitude: lo, start_date: isoDate(s3), end_date: isoDate(Math.min(e3, waveMaxEnd)), timezone: "GMT" }, opt.waveModel) : Promise.resolve([])).catch(e => { marineErr.push("waves: " + e.message); omDown = true; return []; }),
         getWx({ latitude: la, longitude: lo, start_date: isoDate(s3), end_date: isoDate(e3), timezone: "GMT", wind_speed_unit: "kn", cell_selection: "sea", hourly: WX_VARS }, opt.model).catch(() => [])
       ]);
       ch.forEach((n, j) => { if (!n.M) n.M = tm.length === ch.length ? tm[j] : null; if (!n.W) n.W = tw.length === ch.length ? tw[j] : null; });
@@ -1300,7 +1419,7 @@ async function runForecast(opt, progress) {
   // what Open-Meteo did not cover (service down, over the limit, or no value at that time) -> Copernicus waves
   const hasWave = (blk, tt) => val(blk, "wave_height", idxAt(blk, tt)) != null;
   const omWaveOk = mar.filter((m, i) => hasWave(m, etas[i])).length + tn.filter(n => hasWave(n.M, n.t)).length;
-  let waveSrc = omWaveOk ? (usedRelay && mar.some(m => m && m.src === "relay") ? "relay median (MFWAM, ECMWF WAM, GFS-Wave)" : ens && mar.some(m => m && m.ensemble) ? "3-model median (MFWAM, ECMWF WAM, GFS-Wave)" : "Open-Meteo") : "", cmwNote = "", cmwOk = 0;
+  let waveSrc = omWaveOk ? (usedRelay && mar.some(m => m && m.src === "relay") ? relayWaveLabel() : waveModelLabel(opt.waveModel)) : "", cmwNote = "", cmwOk = 0;
   const jobs = [...wps.map((w, i) => ({ lat: w.lat, lon: w.lon, t: etas[i], wp: i })).filter(j => !hasWave(mar[j.wp], j.t)),
                 ...tn.filter((n, q) => q % 2 === 0 && !hasWave(n.M, n.t)).map(n => ({ lat: n.lat, lon: n.lon, t: n.t, node: n }))];   // map points every ~12 h
   if (wantCmW && jobs.length) {
@@ -1319,7 +1438,104 @@ async function runForecast(opt, progress) {
     tn.forEach((n, q) => { if (hasWave(n.M, n.t)) return; const nb = [tn[q - 1], tn[q + 1]].find(x => x && x.wv); if (nb) n.M = synthMarine(n.t, nb.wv, n.M ? currentAt(n.M, n.t) : null); });   // in-between map points
     if (cmwOk) waveSrc = waveSrc ? waveSrc + " + Copernicus where missing" : "Copernicus Marine (Open-Meteo unavailable)";
   }
+  // The chosen model can return total Hs but omit wind-sea / swell partitions.
+  // Supplement only missing fields from a labelled, longer-range partition-capable model; never overwrite ECMWF values.
+  const WAVE_MERGE_VARS = ["wave_height", "wave_direction", "wave_period", "wave_peak_period",
+    "wind_wave_height", "wind_wave_direction", "wind_wave_period", "wind_wave_peak_period",
+    "swell_wave_height", "swell_wave_direction", "swell_wave_period", "swell_wave_peak_period",
+    "secondary_swell_wave_height", "secondary_swell_wave_direction", "secondary_swell_wave_period",
+    "tertiary_swell_wave_height", "tertiary_swell_wave_direction", "tertiary_swell_wave_period"];
+  function countWaveValuesAt(block, tt) {
+    const ix = idxAt(block, tt); let total = 0, partitions = 0;
+    for (const key of WAVE_MERGE_VARS) {
+      const v = val(block, key, ix);
+      if (v == null || !isFinite(v)) continue;
+      if (key.startsWith("wind_wave_") || key.startsWith("swell_wave_") || key.startsWith("secondary_swell_") || key.startsWith("tertiary_swell_")) partitions++;
+      else total++;
+    }
+    return { total, partitions };
+  }
+  function mergeMissingWaveSeries(primary, supplement) {
+    if (!primary || !primary.hourly || !primary.hourly.time || !supplement || !supplement.hourly || !supplement.hourly.time) return { total: 0, partitions: 0 };
+    const ph = primary.hourly, filled = { total: 0, partitions: 0 };
+    for (const key of WAVE_MERGE_VARS) {
+      if (!Array.isArray(ph[key])) ph[key] = Array(ph.time.length).fill(null);
+      for (let i = 0; i < ph.time.length; i++) {
+        if (ph[key][i] != null && isFinite(ph[key][i])) continue;
+        const pt = marineTimeMs(ph.time[i]), si = idxAt(supplement, pt);
+        if (si == null) continue;
+        const st = marineTimeMs(supplement.hourly.time[si]);
+        // Avoid copying data from a materially different valid time when model grids differ.
+        if (!isFinite(st) || Math.abs(st - pt) > 2 * H) continue;
+        const v = val(supplement, key, si);
+        if (v == null || !isFinite(v)) continue;
+        ph[key][i] = v;
+        if (key.startsWith("wind_wave_") || key.startsWith("swell_wave_") || key.startsWith("secondary_swell_") || key.startsWith("tertiary_swell_")) filled.partitions++;
+        else filled.total++;
+      }
+    }
+    return filled;
+  }
+  let gfsWaveFilled = 0, gfsPartitionFilled = 0;
+  // GFS Wave has a longer global forecast window and partition fields. It is used only where selected-model fields are absent.
+  if (opt.waveModel !== "ncep_gfswave025" && opt.waveModel !== "ensemble" && !usedRelay) {   // the relay already carries GFS-Wave
+    const candidates = [];
+    mar.forEach((blk, i) => {
+      const tt = etas[i], ix = idxAt(blk, tt);
+      const needs = !hasWave(blk, tt) || val(blk, "wind_wave_height", ix) == null || val(blk, "swell_wave_height", ix) == null;
+      if (needs && tt <= maxEnd) candidates.push({ lat: wps[i].lat, lon: wps[i].lon, t: tt, get: () => mar[i], set: v => { mar[i] = v; } });
+    });
+    tn.forEach(node => {
+      const ix = idxAt(node.M, node.t);
+      const needs = !hasWave(node.M, node.t) || val(node.M, "wind_wave_height", ix) == null || val(node.M, "swell_wave_height", ix) == null;
+      if (needs && node.t <= maxEnd) candidates.push({ lat: node.lat, lon: node.lon, t: node.t, get: () => node.M, set: v => { node.M = v; } });
+    });
+    if (candidates.length) {
+      progress(`Supplementing missing wave partitions from GFS-Wave at ${candidates.length} sampled points…`);
+      let batchErrors = [];
+      for (let b = 0; b < candidates.length; b += 20) {
+        const ch = candidates.slice(b, b + 20);
+        const qStart = Math.min(...ch.map(x => x.t)) - 3 * H;
+        const qEnd = Math.min(maxEnd, Math.max(...ch.map(x => x.t)) + 3 * H);
+        try {
+          const blocks = await getJSON(MARINE_URL, {
+            latitude: ch.map(x => x.lat.toFixed(3)).join(","),
+            longitude: ch.map(x => x.lon.toFixed(3)).join(","),
+            start_date: isoDate(qStart), end_date: isoDate(qEnd), timezone: "GMT", cell_selection: "sea",
+            hourly: WAVE_VARS, models: "ncep_gfswave025"
+          });
+          if (blocks.length !== ch.length) { batchErrors.push(`GFS-Wave returned ${blocks.length} location(s) for ${ch.length} request(s)`); continue; }
+          ch.forEach((job, j) => {
+            const fb = normalizeModelFields(blocks[j], ["ncep_gfswave025"]);
+            let base = job.get();
+            if (!base) {
+              job.set(fb);
+              const n = countWaveValuesAt(fb, job.t);
+              gfsWaveFilled += n.total; gfsPartitionFilled += n.partitions;
+            } else {
+              const n = mergeMissingWaveSeries(base, fb);
+              gfsWaveFilled += n.total; gfsPartitionFilled += n.partitions;
+            }
+          });
+          progress(`GFS-Wave partition supplement ${Math.min(b + ch.length, candidates.length)}/${candidates.length} points…`);
+        } catch (e) { batchErrors.push(e.message); }
+      }
+      if (gfsPartitionFilled || gfsWaveFilled) {
+        const gfsLabel = `GFS-Wave supplement (${gfsPartitionFilled} partition values, ${gfsWaveFilled} total-wave values filled)`;
+        waveSrc = waveSrc && waveSrc !== "none" ? waveSrc + " + " + gfsLabel : gfsLabel;
+      }
+      if (batchErrors.length && !gfsPartitionFilled) cmwNote = (cmwNote ? cmwNote + "; " : "") + "GFS-Wave partition supplement unavailable: " + batchErrors[0];
+    }
+  }
   if (!waveSrc) waveSrc = "none";
+  // Report only gaps that remain after ECMWF, Copernicus and the explicit partition supplement.
+  const splitMissingAt = (blk, tt) => {
+    if (!hasWave(blk, tt)) return false;
+    const ix = idxAt(blk, tt);
+    return val(blk, "wind_wave_height", ix) == null || val(blk, "swell_wave_height", ix) == null;
+  };
+  const waveSplitMissing = mar.reduce((n, m, i) => n + (splitMissingAt(m, etas[i]) ? 1 : 0), 0)
+    + tn.reduce((n, node) => n + (splitMissingAt(node.M, node.t) ? 1 : 0), 0);
   // waypoint currents in the table: the same source the ETA used
   const wpCur = new Array(wps.length).fill(null);
   const nLeg = i => { let n = 0; pts.forEach(p => { if (p.leg === i) n = Math.max(n, p.k + 1); }); return n; };
@@ -1343,7 +1559,7 @@ async function runForecast(opt, progress) {
       mslp: val(W(i), "pressure_msl", wi), vis: vis == null ? null : vis / 1000
     };
   });
-  return { relay: RL ? { generated: RL.generated, used: usedRelay || relayCurN > 0, cur: relayCurN, wx: rW.filter(Boolean).length, wpN: wps.length } : null, curSrc, cmNote, cmRange, waveSrc, cmwNote, cmN: cmCur.size, marineErr: [...new Set(marineErr)], sogCheck: opt.sogNow > 0 && !(opt.stwNow > 0) && nodes.length && opt.basis !== "sog" ? opt.sogNow - nodes[0].sog : null, sogPlan: nodes.length ? nodes[0].sog : null, stwCalm, along0, loss0, aObs, bias, perf, basis, logNote, logGap, fadeNm: FADE_NM, useLoss, rows, legs, nodes, wps, tot: legs.reduce((s, l) => s + l.dist, 0), days: (etas[etas.length-1] - etas[0]) / 864e5, posInfo, curOk: pts.filter(p => cmCur.has(p.leg + ":" + p.k) || lookup.get(p.leg + ":" + p.k)).length, curN: pts.length };
+  return { relay: RL ? { generated: RL.generated, used: usedRelay || relayCurN > 0, cur: relayCurN, wx: rW.filter(Boolean).length, wpN: wps.length } : null, curSrc, cmNote, cmRange, waveSrc, cmwNote, waveSplitMissing, cmN: cmCur.size, marineErr: [...new Set(marineErr)], sogCheck: opt.sogNow > 0 && !(opt.stwNow > 0) && nodes.length && opt.basis !== "sog" ? opt.sogNow - nodes[0].sog : null, sogPlan: nodes.length ? nodes[0].sog : null, stwCalm, along0, loss0, aObs, bias, perf, basis, logNote, logGap, fadeNm: FADE_NM, useLoss, rows, legs, nodes, wps, tot: legs.reduce((s, l) => s + l.dist, 0), days: (etas[etas.length-1] - etas[0]) / 864e5, posInfo, curOk: pts.filter(p => cmCur.has(p.leg + ":" + p.k) || lookup.get(p.leg + ":" + p.k)).length, curN: pts.length };
 }
 
 /* ---------- formatting ---------- */
@@ -1392,7 +1608,7 @@ function speedText(res, opt) {
 function tableText(res, opt) {
   const L = [];
   L.push(opt.voyage);
-  L.push(`From ${res.rows[0].name} ${fmtLT(res.rows[0].eta, opt.off)} LT (UTC${opt.off >= 0 ? "+" : ""}${opt.off}) | ${speedText(res, opt)} | ${res.tot.toFixed(0)} nm | ${res.days.toFixed(2)} days | ETA ${fmtLT(res.rows[res.rows.length-1].eta, opt.off)} LT | model ${opt.model}`);
+  L.push(`From ${res.rows[0].name} ${fmtLT(res.rows[0].eta, opt.off)} LT (UTC${opt.off >= 0 ? "+" : ""}${opt.off}) | ${speedText(res, opt)} | ${res.tot.toFixed(0)} nm | ${res.days.toFixed(2)} days | ETA ${fmtLT(res.rows[res.rows.length-1].eta, opt.off)} LT | wind ${windModelLabel(opt.model)} | waves ${waveModelLabel(opt.waveModel)}`);
   const head = "WP Name                   ETA LT      Co  SOG   Wind kn Gst BF Rel          Hs  WSea Swl   m    s  Rel          Set  kn  Along MSLP Roll    Light";
   L.push(head, "-".repeat(head.length));
   res.rows.forEach(r => {
@@ -1464,7 +1680,29 @@ if (typeof document !== "undefined") {
   $("spdBasis").addEventListener("change", spdInfo);
   spdInfo(); window.addEventListener("pwp:ship", spdInfo);
   $("curSrc").value = store.get("curSrc") || "copernicus";
-  $("model").value = store.get("ensOn") ? (store.get("model") || "ensemble") : "ensemble"; store.set("ensOn", "1");
+  // One-time migration: use the dedicated ECMWF IFS HRES 9 km endpoint for wind,
+  // while retaining the selected ECMWF WAM 9 km marine forecast for waves/swell.
+  if (!store.get("ecmwfModelsDefaultV1")) {
+    store.set("model", "ecmwf_hres");
+    store.set("waveModel", "ecmwf_wam");
+    store.set("ecmwfModelsDefaultV1", "1");
+  }
+  if (!store.get("ecmwfWindHresV3")) {
+    if (!store.get("model") || store.get("model") === "ecmwf_ifs025") store.set("model", "ecmwf_hres");
+    store.set("ecmwfWindHresV3", "1");
+  }
+  if (!store.get("ecmwfWamHourlyV2")) {
+    if (!store.get("waveModel") || store.get("waveModel") === "ecmwf_wam025") store.set("waveModel", "ecmwf_wam");
+    store.set("ecmwfWamHourlyV2", "1");
+  }
+  if (!store.get("modelPickV4")) {          // v4: single-model choice now really applies; start from all-model median
+    store.set("model", "ensemble"); store.set("waveModel", "ensemble"); store.set("modelPickV4", "1");
+  }
+  $("model").value = store.get("model") || "ensemble";
+  $("waveModel").value = store.get("waveModel") || "ensemble";
+  if (!$("model").value) $("model").value = "ensemble";
+  if (!$("waveModel").value) $("waveModel").value = "ensemble";
+  store.set("ensOn", "1");
   $("resetRoute").onclick = () => { $("route").value = DEFAULT_ROUTE; $("voy").value = DEFAULT_VOYAGE; refreshQuick(); };
 
   let xlsxP = null;
@@ -1541,17 +1779,18 @@ if (typeof document !== "undefined") {
       if (!m) throw new Error("Enter the date and time of the position.");
       const startUTC = Date.UTC(+m[1], +m[2] - 1, +m[3], +m[4], +m[5]) - off * H;
       const sh = activeShip();
-      opt = { route, pos, off, stw, ordered, sogNow, stwNow, basis, curSource: $("curSrc").value, startUTC, model: $("model").value, voyage: $("voy").value.trim() || "Voyage",
+      opt = { route, pos, off, stw, ordered, sogNow, stwNow, basis, curSource: $("curSrc").value, startUTC, model: $("model").value, waveModel: $("waveModel").value, voyage: $("voy").value.trim() || "Voyage",
               ship: { lpp: sh.lpp, disp: sh.disp, cb: sh.cb, cond: sh.cond || "laden", lossCal: sh.lossCal, useLoss: sh.useLoss !== false } };
-      ["mode","lt","off","sogNow","stwNow","spdBasis","curSrc","model","route","voy", ...POS_IDS].forEach(k => store.set(k, $(k).value));
+      ["mode","lt","off","sogNow","stwNow","spdBasis","curSrc","model","waveModel","route","voy", ...POS_IDS].forEach(k => store.set(k, $(k).value));
     } catch (e) { status(e.message, true); return; }
 
     $("runBtn").disabled = true;
+    const t0 = Date.now(), n0 = { ...NET };            // meter includes the relay download
     { const u = $("relayUrl").value.trim() || (/^https?:/.test(location.protocol) ? new URL("relay.json", location.href).href : "");
       store.set("relayUrl", $("relayUrl").value.trim());
       if (u) { status("Checking the weather relay…"); const r = await loadRelay(u); RELAY_STATE = { url: u, ...r, data: undefined, generated: r.data && r.data.generated, log: r.data && r.data.log };
         if (r.ok) opt.relay = r.data; } else RELAY_STATE = { note: "no relay set" }; }
-    const t0 = Date.now(), n0 = { ...NET }; let lastMsg = "Starting…";
+    let lastMsg = "Starting…";
     const meter = () => `${Math.round((Date.now() - t0) / 1000)} s · ${fmtBytes(NET.bytes - n0.bytes)} · ${NET.reqs - n0.reqs} requests`;
     const tick = setInterval(() => status(`${lastMsg} · ${meter()}`), 1000);
     try {
@@ -1560,7 +1799,7 @@ if (typeof document !== "undefined") {
       last = { res, opt };
       render(res, opt);
       window.dispatchEvent(new CustomEvent("pwp:forecast", { detail: { res, opt } }));
-      status(`Done in ${meter()} · ${res.relay && res.relay.used ? `relay ${fmtAge(res.relay.generated)} · ` : RELAY_STATE && RELAY_STATE.url ? `relay not used (${RELAY_STATE.note || "route differs"}) · ` : ""}currents: ${res.curSrc} (${res.curOk}/${res.curN} pts) · waves: ${res.waveSrc} · wind: ${res.relay && res.relay.wx ? "ECMWF IFS + AIFS + GFS median (relay)" : opt.model === "ensemble" ? "ECMWF + GFS + ICON median" : opt.model} · run ${new Date().toISOString().slice(0,16).replace("T"," ")}Z` + (res.marineErr && res.marineErr.length ? ` · Open-Meteo said: ${res.marineErr[0]}` : ""), !res.curOk && res.marineErr && res.marineErr.length);
+      status(`Done in ${meter()} · ${res.relay && res.relay.used ? `relay ${fmtAge(res.relay.generated)} · ` : RELAY_STATE && RELAY_STATE.url ? `relay not used (${RELAY_STATE.note || "route differs"}) · ` : ""}currents: ${res.curSrc} (${res.curOk}/${res.curN} pts) · waves: ${res.waveSrc} · wind: ${res.relay && res.relay.wx ? relayWxLabel() : windModelLabel(opt.model)} · run ${new Date().toISOString().slice(0,16).replace("T"," ")}Z` + (res.marineErr && res.marineErr.length ? ` · Open-Meteo said: ${res.marineErr[0]}` : ""), !res.curOk && res.marineErr && res.marineErr.length);
     } catch (e) {
       clearInterval(tick);
       status("Could not get forecast data: " + e.message + ". Check the internet connection and run again. (" + meter() + ")", true);
@@ -1607,18 +1846,19 @@ if (typeof document !== "undefined") {
     if (res.aObs != null && Math.abs(res.bias) >= 1) al.unshift(["warn", `Current felt now (SOG − STW) ${sgn(res.aObs)} kts differs from the model ${sgn(res.along0)} kts by ${Math.abs(res.bias).toFixed(1)} kts. The difference is applied to the ETA and fades out over the next ~${res.fadeNm} nm.`]);
     if (res.cmNote) al.unshift(["warn", `Copernicus currents not used: ${res.cmNote}. ETAs use ${res.curSrc}.`]);
     if (res.curOk < res.curN && res.cmRange) al.unshift(["warn", `Copernicus currents cover ${res.curOk} of ${res.curN} track points (${res.cmRange}). Beyond that the ETA uses the route's climatological current (violet ✱ in Leg SOG).`]);
-    if (res.cmwNote) al.unshift(["warn", `Copernicus wave backup not available: ${res.cmwNote}. Waves from: ${res.waveSrc}.`]);
+    if (res.cmwNote) al.unshift(["warn", `Supplementary wave-data note: ${res.cmwNote}. Wave source(s): ${res.waveSrc}.`]);
+    if (res.waveSplitMissing > 0) al.unshift(["warn", `Wind-sea and/or swell partitions remain unavailable at ${res.waveSplitMissing} sampled point(s) after available-source supplementation. Missing values are left blank, not invented.`]);
     if (/Copernicus/.test(res.waveSrc) && res.marineErr && res.marineErr.some(m => !m.startsWith("wind: "))) al.unshift(["warn", `Open-Meteo marine unavailable (${res.marineErr.find(m => !m.startsWith("wind: "))}) – waves, sea and swell taken from Copernicus Marine.`]);
     const windErr = (res.marineErr || []).find(m => m.startsWith("wind: "));
-    if (windErr) al.unshift(["warn", `Open-Meteo wind unavailable (${windErr.slice(6)}). Wind, gusts and pressure show "–" until it is back; currents and waves still come from Copernicus.`]);
+    if (windErr) al.unshift(["warn", `Wind forecast incomplete (${windErr.slice(6)}). Missing wind, gust and pressure values are left blank rather than guessed; see the diagnostics for the selected ECMWF source.`]);
     if (res.marineErr && res.marineErr.length && !res.curOk) al.unshift(["crit", `No current data: ${res.marineErr[0]}. ETAs below use climatological currents only. Wait a few minutes and run again.`]);
     if (res.posInfo && res.posInfo.off > 60) al.unshift(["crit", `Position is ${res.posInfo.off.toFixed(0)} nm from the route line. Check the position or the waypoint list.`]);
     $("alerts").innerHTML = al.map(([c, t]) => `<li class="${c === "crit" ? "crit" : c === "ok" ? "ok" : ""}">${esc(t)}</li>`).join("");
 
     let h = `<thead><tr><th colspan="6" class="grp l">Track</th><th colspan="6" class="grp">Wind</th><th colspan="7" class="grp">Sea</th><th colspan="3" class="grp">Current</th><th colspan="2" class="grp">Met</th><th colspan="2" class="grp">Ship</th></tr>
       <tr><th>WP</th><th class="l">Waypoint</th><th class="l">ETA LT</th><th>Co</th><th title="Mean speed through water on the leg ending here: ordered speed less weather loss">Leg STW</th><th title="Mean speed over ground on the leg ending here: STW + current">Leg SOG</th>
-      <th>Dir</th><th>kts</th><th title="Lowest – highest wind of the models (ECMWF, GFS, ICON); value shown is the median">Models</th><th>Gust</th><th>BF</th><th class="l">Rel</th>
-      <th>Hs m</th><th title="Lowest – highest Hs of the wave models (MFWAM, ECMWF WAM, GFS-Wave); value shown is the median">Models</th><th>Wind sea</th><th>Swell</th><th>m</th><th>s</th><th class="l">Rel</th>
+      <th>Dir</th><th>kts</th><th title="Wind model spread where multiple models are selected">Models</th><th>Gust</th><th>BF</th><th class="l">Rel</th>
+      <th>Hs m</th><th title="Wave model spread where multiple models are selected">Models</th><th>Wind sea</th><th>Swell</th><th>m</th><th>s</th><th class="l">Rel</th>
       <th>Set</th><th>kts</th><th>Along</th><th>MSLP</th><th>Vis km</th><th class="l">Roll</th><th class="l">Light</th></tr></thead><tbody>`;
     R.forEach(r => {
       const sog = r.sog == null ? "" : `${f1(r.sog)}${r.clim ? ` <span class="clim" title="No forecast current for most of this leg – route climatological current used">✱</span>` : ""}`;
@@ -1629,7 +1869,7 @@ if (typeof document !== "undefined") {
     });
     $("tbl").innerHTML = h + "</tbody>";
     const r0 = R[0];
-    $("printMeta").textContent = `Voyage: ${opt.voyage}  |  From: ${r0.name} ${fmtPos(r0.lat, r0.lon)} at ${fmtLT(r0.eta, off)} LT (UTC${off >= 0 ? "+" : ""}${off})  |  ${speedText(res, opt)}  |  Wind model: ${opt.model}  |  Forecast run: ${new Date().toISOString().slice(0,16).replace("T"," ")}Z  |  Sources: Copernicus Marine (currents, waves backup), Open-Meteo (wind, waves)  |  Ship: ${activeShip().name}${(() => { const rp = rollPeriod(activeShip()); return rp ? ` (Tr ${rp.tr.toFixed(1)} s, ${rp.src})` : ""; })()}`;
+    $("printMeta").textContent = `Voyage: ${opt.voyage}  |  From: ${r0.name} ${fmtPos(r0.lat, r0.lon)} at ${fmtLT(r0.eta, off)} LT (UTC${off >= 0 ? "+" : ""}${off})  |  ${speedText(res, opt)}  |  Wind: ${windModelLabel(opt.model)}  |  Waves/swell: ${res.waveSrc}  |  Forecast run: ${new Date().toISOString().slice(0,16).replace("T"," ")}Z  |  Currents: ${res.curSrc}; Copernicus wave backup if missing  |  Ship: ${activeShip().name}${(() => { const rp = rollPeriod(activeShip()); return rp ? ` (Tr ${rp.tr.toFixed(1)} s, ${rp.src})` : ""; })()}`;
     ["sumPanel","tbox","outActions","legend"].forEach(id => $(id).hidden = false);
   }
 
@@ -1639,8 +1879,8 @@ if (typeof document !== "undefined") {
       app: "passage_weather.html", at: new Date().toISOString(), browser: navigator.userAgent, status: $("status").textContent,
       speed: r && { basis: r.basis, stwCalm: +r.stwCalm.toFixed(2), ordered: o.ordered, sogNow: o.sogNow, stwNow: o.stwNow, modelAlongNow: +(r.along0 || 0).toFixed(2), felt: r.aObs, bias: r.bias, weatherLoss: r.useLoss, logNote: r.logNote },
       currents: r && { src: r.curSrc, ok: r.curOk, of: r.curN, range: r.cmRange, note: r.cmNote, vectorOneRequest: CMVEC.ok, layers: ci && (ci.alts || [ci]).map(a => ({ id: a.id.split("/").slice(-2).join("/"), step: a.step, end: cmEnd(a) ? new Date(cmEnd(a)).toISOString() : null })) },
-      models: o && o.model, relay: RELAY_STATE && { url: RELAY_STATE.url, ok: RELAY_STATE.ok, note: RELAY_STATE.note, generated: RELAY_STATE.generated, used: r && r.relay, serverLog: (RELAY_STATE.log || []).slice(-12) },
-      waves: r && { src: r.waveSrc, note: r.cmwNote, layer: CMW_INFO && CMW_INFO.prefix.split("/").pop() },
+      models: o && { wind: o.model, windLabel: windModelLabel(o.model), wave: o.waveModel, waveLabel: waveModelLabel(o.waveModel) }, relay: RELAY_STATE && { url: RELAY_STATE.url, ok: RELAY_STATE.ok, note: RELAY_STATE.note, generated: RELAY_STATE.generated, used: r && r.relay, serverLog: (RELAY_STATE.log || []).slice(-12) },
+      waves: r && { src: r.waveSrc, partitionMissing: r.waveSplitMissing, note: r.cmwNote, layer: CMW_INFO && CMW_INFO.prefix.split("/").pop() },
       openMeteo: r && r.marineErr, tiles: { cal: CMD.cal, diag: CMD.diag || "" }, map: window.__pwpMapDiag ? window.__pwpMapDiag() : null,
       net: { requests: NET.reqs, bytes: NET.bytes }, rawSample: CMEMS_RAW ? CMEMS_RAW.slice(0, 200) : ""
     };
@@ -2220,9 +2460,21 @@ if (typeof module !== "undefined") module.exports = { cmemsTime, gfiValue, tileO
     if (tCur > maxEnd) throw new Error("timeline is beyond the forecast range");
     const t0 = Math.max(tCur - 12 * H, Date.now() - 5 * 864e5), t1 = Math.min(Math.max(tCur, t0) + 84 * H, maxEnd);
     const common = { latitude: lats.join(","), longitude: lons.join(","), start_date: isoDate(t0), end_date: isoDate(t1), timezone: "GMT" };
-    const res = kind === "wind" ? await getJSON(WX_URL, { ...common, hourly: "wind_speed_10m,wind_direction_10m", wind_speed_unit: "kn", models: data.opt.model === "ensemble" ? "ecmwf_ifs025" : data.opt.model })
-      : kind === "waves" ? await getJSON(MARINE_URL, { ...common, hourly: "wave_height,wave_direction" })
-      : await getJSON(MARINE_URL, { ...common, hourly: "ocean_current_velocity,ocean_current_direction" });
+    let res;
+    if (kind === "wind") {
+      const wp = { ...common, hourly: "wind_speed_10m,wind_direction_10m", wind_speed_unit: "kn" };
+      // Use the same model-aware request helper as the route forecast. In ECMWF HRES mode
+      // this routes to /v1/ecmwf and deliberately omits the unsupported models=ecmwf_hres
+      // parameter that caused the map overlay to fail while the own-ship forecast worked.
+      res = await getWx(wp, data.opt.model);
+    } else if (kind === "waves") {
+      const wp = { ...common, hourly: "wave_height,wave_direction" };
+      if (data.opt.waveModel === "ensemble") res = (await getJSON(MARINE_URL, { ...wp, models: ENS_WAVE.join(",") })).map(b => ensembleBlock(b, ENS_WAVE));
+      else if (data.opt.waveModel && data.opt.waveModel !== "best_match") res = (await getJSON(MARINE_URL, { ...wp, models: data.opt.waveModel })).map(b => normalizeModelFields(b, [data.opt.waveModel]));
+      else res = await getJSON(MARINE_URL, wp);
+    } else {
+      res = await getJSON(MARINE_URL, { ...common, hourly: "ocean_current_velocity,ocean_current_direction" });
+    }
     if (res.length !== nx * ny) throw new Error("incomplete grid data");
     const times = res[0].hourly.time, nh = times.length, N = nx * ny;
     const S = [], U = [], V = [];
@@ -2358,7 +2610,7 @@ if (typeof module !== "undefined") module.exports = { cmemsTime, gfiValue, tileO
   function layerLabel() {
     const g = WXL.grid, cm = g && g.timeKey, res = g && g.res ? " (" + g.res + ")" : "";
     const mt = cm ? ` · model time ${fmtLT(Date.parse(g.timeKey), data.opt.off)} LT` + (g.delta ? ` · changed ${g.delta.v.toFixed(2)} ${g.kind === "waves" ? "m" : "kn"} avg vs ${fmtLT(Date.parse(g.delta.from), data.opt.off).slice(-4)} LT field` : "") : "";
-    return mt.length && WXL.kind === g.kind ? ({ waves: "Sig. wave height, Copernicus (Open-Meteo unavailable)" + res, cmcur: `Copernicus current, incl. tides, ±${CORR_NM} nm of route` + res }[WXL.kind] || "") + mt : { wind: "Wind 10 m (Open-Meteo)", waves: cm ? "Sig. wave height + mean direction, Copernicus (Open-Meteo unavailable)" + res : "Sig. wave height + direction (Open-Meteo)", current: "Surface current (Open-Meteo)", cmcur: "Copernicus current, incl. tides" + res }[WXL.kind];
+    return mt.length && WXL.kind === g.kind ? ({ waves: "Sig. wave height, Copernicus (Open-Meteo unavailable)" + res, cmcur: `Copernicus current, incl. tides, ±${CORR_NM} nm of route` + res }[WXL.kind] || "") + mt : { wind: `Wind 10 m · ${windModelLabel(data.opt.model)}`, waves: cm ? "Sig. wave height + mean direction, Copernicus (Open-Meteo unavailable)" + res : `Sig. wave height + direction · ${waveModelLabel(data.opt.waveModel)}`, current: "Surface current (Open-Meteo)", cmcur: "Copernicus current, incl. tides" + res }[WXL.kind];
   }
   function wxTimeChanged() {
     const g = WXL.grid; if (!g || WXL.kind === "none") return;
@@ -2728,7 +2980,7 @@ if (typeof module !== "undefined") module.exports = { cmemsTime, gfiValue, tileO
     }
     if (!blk) {
       const [om, c, w] = await Promise.all([
-        getMarine({ latitude: lat, longitude: lon, start_date: day, end_date: day, timezone: "GMT" }, data.opt.model === "ensemble").then(r => r[0]).catch(() => null),
+        getMarine({ latitude: lat, longitude: lon, start_date: day, end_date: day, timezone: "GMT" }, data.opt.waveModel || "ecmwf_wam").then(r => r[0]).catch(() => null),
         useCm ? cmemsPoint(lat, lon, t).catch(() => null) : null,
         getWx({ latitude: lat, longitude: lon, start_date: day, end_date: day, timezone: "GMT", wind_speed_unit: "kn", cell_selection: "sea", hourly: WX_VARS }, data.opt.model).then(r => r[0]).catch(e => ({ err: e.message }))
       ]);
